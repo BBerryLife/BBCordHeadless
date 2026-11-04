@@ -30,6 +30,8 @@ private slots:
     void onLoginSucceeded();
     void onLoginFailed(const QString &message);
     void onStopRequested();
+    // Logs memory use while the client runs, so a memory-related kill can be seen coming.
+    void onHeartbeat();
 
 private:
     void startClient();
@@ -40,13 +42,18 @@ private:
     bb::system::InvokeManager *m_invoke;
     QTimer *m_pollTimer;
     QTimer *m_retryTimer;
+    QTimer *m_heartbeatTimer;
+    int m_heartbeatTicks;
     AppStore *m_store;
     DiscordClient *m_client;
     bool m_lastUiAlive;
     // The saved token was rejected (or is missing): stay idle until the UI has run again,
     // since only the user can fix that.
     bool m_sessionDead;
+    bool m_gatewayNoticeLogged;
     int m_retryDelayMs;
+    // Consecutive out-of-memory failures while receiving gateway data (see onLoginFailed()).
+    int m_oomFailures;
 };
 
 #endif

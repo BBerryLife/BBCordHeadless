@@ -8,6 +8,8 @@
 #include <bb/system/InvokeManager>
 #include <bb/system/InvokeRequest>
 
+#include <malloc.h>
+
 #include <QByteArray>
 #include <QDebug>
 #include <QSettings>
@@ -50,11 +52,15 @@ ServiceController::ServiceController(QObject *parent)
       m_invoke(new bb::system::InvokeManager(this)),
       m_pollTimer(new QTimer(this)),
       m_retryTimer(new QTimer(this)),
+      m_heartbeatTimer(new QTimer(this)),
+      m_heartbeatTicks(0),
       m_store(0),
       m_client(0),
       m_lastUiAlive(false),
       m_sessionDead(false),
-      m_retryDelayMs(RETRY_MIN_MS)
+      m_gatewayNoticeLogged(false),
+      m_retryDelayMs(RETRY_MIN_MS),
+      m_oomFailures(0)
 {
     connect(m_invoke, SIGNAL(invoked(const bb::system::InvokeRequest&)),
             this,     SLOT(onInvoked(const bb::system::InvokeRequest&)));
@@ -65,6 +71,10 @@ ServiceController::ServiceController(QObject *parent)
 
     m_retryTimer->setSingleShot(true);
     connect(m_retryTimer, SIGNAL(timeout()), this, SLOT(evaluate()));
+
+    m_heartbeatTimer->setInterval(5000);
+    connect(m_heartbeatTimer, SIGNAL(timeout()), this, SLOT(onHeartbeat()));
+    m_heartbeatTimer->start();
 
     qDebug() << "[Service] started";
     // Not immediately: at boot the UI may be starting too.
@@ -85,6 +95,7 @@ void ServiceController::evaluate()
             // The user may have logged in again while the UI was up.
             m_sessionDead = false;
             m_retryDelayMs = RETRY_MIN_MS;
+            m_oomFailures = 0;
         }
         m_lastUiAlive = uiAlive;
     }
@@ -97,6 +108,22 @@ void ServiceController::evaluate()
     }
 
     if (m_sessionDead || m_client || m_retryTimer->isActive()) return;
+
+    // The background gateway is off by default: the system limits this process to 3 MB of
+    // heap (RLIMIT_DATA, logged at start), and Discord's READY payload is ~5 MB, so the
+    // connection runs out of memory ("OOM") every time, and every attempt costs an IDENTIFY.
+    // Kept for devices/systems with a higher limit: QSettings("BBerryLife","BBCordHub")
+    // key service/gateway = true.
+    QSettings hubSettings(QLatin1String("BBerryLife"), QLatin1String("BBCordHub"));
+    hubSettings.sync();
+    if (!hubSettings.value(QLatin1String("service/gateway"), false).toBool()) {
+        if (!m_gatewayNoticeLogged) {
+            m_gatewayNoticeLogged = true;
+            qDebug() << "[Service] background gateway is disabled (3 MB memory cap) - the"
+                     << "service only handles Hub actions; use \"Keep running when closed\" in the app";
+        }
+        return;
+    }
     startClient();
 }
 
@@ -118,6 +145,7 @@ void ServiceController::startClient()
     m_client->setHeadlessMode(true);
     connect(m_client, SIGNAL(loginSucceeded()), this, SLOT(onLoginSucceeded()));
     connect(m_client, SIGNAL(loginFailed(QString)), this, SLOT(onLoginFailed(QString)));
+    m_heartbeatTicks = 0;
     m_client->autoLogin();
 }
 
@@ -134,10 +162,22 @@ void ServiceController::stopClient()
     m_store = 0;
 }
 
+void ServiceController::onHeartbeat()
+{
+    if (!m_client) return;
+    ++m_heartbeatTicks;
+    // Every 5 s for the first 2 minutes (the heavy READY payload arrives then), then every 5 min.
+    if (m_heartbeatTicks > 24 && (m_heartbeatTicks % 60) != 0) return;
+    struct mallinfo mi = mallinfo();
+    qDebug() << "[Service] alive, malloc heap in use ~" << (mi.uordblks + mi.hblkhd) / (1024 * 1024)
+             << "MB (mallinfo: does not count every mapping)";
+}
+
 void ServiceController::onLoginSucceeded()
 {
     qDebug() << "[Service] background gateway connected";
     m_retryDelayMs = RETRY_MIN_MS;
+    m_oomFailures = 0;
 }
 
 void ServiceController::onLoginFailed(const QString &message)
@@ -147,6 +187,17 @@ void ServiceController::onLoginFailed(const QString &message)
     if (message.contains(QLatin1String("Invalid Discord token"))) {
         m_sessionDead = true;
         qWarning() << "[Service] the saved token was rejected - idle until the app runs again";
+    } else if (message.contains(QLatin1String("OOM"))) {
+        // Out of memory is repeatable: the same data will fail the same way, and every retry sends
+        // a new IDENTIFY to Discord. Try once more, then stop until the app has run again.
+        ++m_oomFailures;
+        if (m_oomFailures >= 2) {
+            m_sessionDead = true;
+            qWarning() << "[Service] out of memory receiving gateway data" << m_oomFailures
+                       << "times - giving up the background connection until the app runs again";
+        } else {
+            scheduleRetry();
+        }
     } else {
         scheduleRetry();
     }

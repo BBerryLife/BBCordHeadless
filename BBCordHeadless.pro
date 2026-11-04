@@ -28,12 +28,19 @@ SOURCES += $$UI_ROOT/third_party/mongoose/mongoose.c
 HEADERS += $$UI_ROOT/third_party/mongoose/mongoose.h
 DEFINES += MG_TLS=MG_TLS_OPENSSL MG_ENABLE_POLL=1 MG_ENABLE_LOG=0 \
            MG_ENABLE_OPENSSL=1 MG_MAX_RECV_SIZE=67108864 MG_ENABLE_LINES=1
+
+# Mongoose grows its receive buffer by MG_IO_SIZE per step (16 KB by default), allocating a new
+# block and copying the old one each time. The ~5 MB READY payload then needs 300+ reallocations,
+# which fragments the heap and ran this memory-limited headless process out of memory
+# ("OOM"). A 128 KB step cuts that to ~40. Service only: BBCord.pro keeps the default.
+DEFINES += MG_IO_SIZE=131072
 QMAKE_CFLAGS += -Wc,-std=gnu99
 QMAKE_CFLAGS += -Wc,"-DMG_TLS=MG_TLS_OPENSSL"
 QMAKE_CFLAGS += -Wc,"-DMG_ENABLE_OPENSSL=1"
 QMAKE_CFLAGS += -Wc,"-DMG_ENABLE_POLL=1"
 QMAKE_CFLAGS += -Wc,"-DMG_ENABLE_LOG=0"
 QMAKE_CFLAGS += -Wc,"-DMG_MAX_RECV_SIZE=67108864"
+QMAKE_CFLAGS += -Wc,"-DMG_IO_SIZE=131072"
 
 # LIBS paths are used from the build folder (arm/ or x86/), so they must be absolute: $$PWD.
 simulator {
