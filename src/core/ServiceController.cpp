@@ -2,8 +2,12 @@
 
 #include "core/AppStore.hpp"
 #include "core/Client.hpp"
+#include "core/HubIntegration.hpp"
 #include "core/HubShared.hpp"
 #include "core/ServiceHandoff.hpp"
+#include "core/ServiceSession.hpp"
+#include "core/client/GatewayHandler.hpp"
+#include "core/discord/Gateway.hpp"
 
 #include <bb/system/InvokeManager>
 #include <bb/system/InvokeRequest>
@@ -11,6 +15,7 @@
 #include <malloc.h>
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QDebug>
 #include <QSettings>
 #include <QTimer>
@@ -22,6 +27,10 @@ static const int POLL_INTERVAL_MS = 4000;
 // 5 min. Reset by a successful login.
 static const int RETRY_MIN_MS = 15000;
 static const int RETRY_MAX_MS = 300000;
+// An always-on background service has no reason to wake 100x/s like the UI's 10 ms loop.
+// Notifications do not need sub-second latency.
+static const int SERVICE_POLL_MS = 250;
+static const int RECENT_IDS_MAX = 64;
 
 // The Hub invoke data is JSON like {"attributes": {"sourceId": "<channelId>", ...}}. Only
 // that one field is needed, so it is read with a plain scan instead of a JSON library.
@@ -60,7 +69,13 @@ ServiceController::ServiceController(QObject *parent)
       m_sessionDead(false),
       m_gatewayNoticeLogged(false),
       m_retryDelayMs(RETRY_MIN_MS),
-      m_oomFailures(0)
+      m_oomFailures(0),
+      m_gateway(0),
+      m_notifier(0),
+      m_hub(0),
+      m_gatewayNeedsReconnect(false),
+      m_resumeSeq(-1),
+      m_resumeRetried(false)
 {
     connect(m_invoke, SIGNAL(invoked(const bb::system::InvokeRequest&)),
             this,     SLOT(onInvoked(const bb::system::InvokeRequest&)));
@@ -107,24 +122,162 @@ void ServiceController::evaluate()
         return;
     }
 
-    if (m_sessionDead || m_client || m_retryTimer->isActive()) return;
+    if (m_sessionDead || m_retryTimer->isActive()) return;
 
-    // The background gateway is off by default: the system limits this process to 3 MB of
-    // heap (RLIMIT_DATA, logged at start), and Discord's READY payload is ~5 MB, so the
-    // connection runs out of memory ("OOM") every time, and every attempt costs an IDENTIFY.
-    // Kept for devices/systems with a higher limit: QSettings("BBerryLife","BBCordHub")
-    // key service/gateway = true.
-    QSettings hubSettings(QLatin1String("BBerryLife"), QLatin1String("BBCordHub"));
-    hubSettings.sync();
-    if (!hubSettings.value(QLatin1String("service/gateway"), false).toBool()) {
-        if (!m_gatewayNoticeLogged) {
-            m_gatewayNoticeLogged = true;
-            qDebug() << "[Service] background gateway is disabled (3 MB memory cap) - the"
-                     << "service only handles Hub actions; use \"Keep running when closed\" in the app";
-        }
+    if (m_gateway) {
+        // Dropped without a close/error signal (or the retry timer just fired).
+        if (m_gateway->state() == DiscordGateway::Disconnected) m_gatewayNeedsReconnect = true;
+        if (m_gatewayNeedsReconnect) reconnectGateway();
         return;
     }
-    startClient();
+    if (m_client) return;
+
+    // Default: take over the UI's gateway session with a RESUME. A RESUME produces no READY,
+    // so it fits the ~3 MB heap limit of this process (RLIMIT_DATA, logged at start); an
+    // IDENTIFY cannot (its ~5 MB READY ran out of memory every time).
+    // QSettings("BBerryLife","BBCordHub") key service/gateway = true selects the old full
+    // client instead, only useful on a system with a higher limit.
+    QSettings hubSettings(QLatin1String("BBerryLife"), QLatin1String("BBCordHub"));
+    hubSettings.sync();
+    if (hubSettings.value(QLatin1String("service/gateway"), false).toBool()) {
+        startClient();
+    } else {
+        startResumeSession();
+    }
+}
+
+void ServiceController::startResumeSession()
+{
+    QSettings settings;
+    settings.sync();
+    m_token = settings.value("auth/token").toString().trimmed();
+    if (m_token.isEmpty()) {
+        qDebug() << "[Service] no saved Discord token - staying idle until the app logs in";
+        m_sessionDead = true;
+        return;
+    }
+
+    ServiceSession::GatewayState gs;
+    if (!ServiceSession::loadGateway(&gs)) {
+        qDebug() << "[Service] no gateway session left by the app yet - idle until the app has run";
+        m_sessionDead = true;
+        return;
+    }
+
+    AppStore *store = new AppStore(this);
+    if (!ServiceSession::loadProfile(store, &m_userId)) {
+        qDebug() << "[Service] no notification profile left by the app yet - idle until the app has run";
+        delete store;
+        m_sessionDead = true;
+        return;
+    }
+    m_store = store;
+
+    qDebug() << "[Service] UI closed - resuming the gateway session, seq" << gs.seq
+             << "age s" << (QDateTime::currentMSecsSinceEpoch() - gs.savedMs) / 1000;
+
+    m_hub = new HubIntegration(this);
+    m_hub->setServiceMode(true);
+    m_hub->init();
+    m_notifier = new GatewayHandler(0, m_store, this);
+
+    m_gateway = new DiscordGateway(this);
+    m_gateway->setPollIntervalMs(SERVICE_POLL_MS);
+    m_gateway->setHeartbeatWatchdog(true);
+    // Lets the light MESSAGE_CREATE parser flag mentions of us.
+    m_gateway->updateMessageFilterState(QString(), QStringList(), m_userId);
+    connect(m_gateway, SIGNAL(dispatchReceived(QString,QVariantMap)),
+            this, SLOT(onGatewayDispatch(QString,QVariantMap)));
+    connect(m_gateway, SIGNAL(error(QString)), this, SLOT(onGatewayDown(QString)));
+    connect(m_gateway, SIGNAL(closed()), this, SLOT(onGatewayClosed()));
+    connect(m_gateway, SIGNAL(sessionInvalid()), this, SLOT(onSessionInvalid()));
+    connect(m_gateway, SIGNAL(ready(QString)), this, SLOT(onLoginSucceeded()));
+
+    m_heartbeatTicks = 0;
+    m_gatewayNeedsReconnect = false;
+    m_resumeSid = gs.sessionId;
+    m_resumeUrl = gs.resumeUrl;
+    m_resumeSeq = gs.seq;
+    m_resumeRetried = false;
+    m_gateway->resumeGateway(m_token, gs.sessionId, gs.resumeUrl, gs.seq);
+}
+
+void ServiceController::reconnectGateway()
+{
+    if (!m_gateway) return;
+    m_gatewayNeedsReconnect = false;
+    const QString sid = m_gateway->sessionId();
+    if (sid.isEmpty() || m_gateway->sequence() < 0) {
+        // Nothing to resume (e.g. the session was refused): only the app can fix that.
+        m_sessionDead = true;
+        QTimer::singleShot(0, this, SLOT(onStopRequested()));
+        return;
+    }
+    qDebug() << "[Service] reconnecting (RESUME), seq" << m_gateway->sequence();
+    m_gateway->resumeGateway(m_token, sid, m_gateway->resumeGatewayUrl(), m_gateway->sequence());
+}
+
+void ServiceController::onGatewayDown(const QString &reason)
+{
+    qWarning() << "[Service] gateway error:" << reason;
+    // MG_EV_CLOSE follows an error and emits closed(); reconnect from there / the poll.
+    if (!m_retryTimer->isActive()) {
+        m_gatewayNeedsReconnect = true;
+        scheduleRetry();
+    }
+}
+
+void ServiceController::onGatewayClosed()
+{
+    qDebug() << "[Service] gateway closed";
+    if (!m_retryTimer->isActive() && m_gateway) {
+        m_gatewayNeedsReconnect = true;
+        scheduleRetry();
+    }
+}
+
+void ServiceController::retryResume()
+{
+    if (!m_gateway || m_sessionDead) return;
+    qDebug() << "[Service] retrying the RESUME once, seq" << m_resumeSeq;
+    m_gateway->resumeGateway(m_token, m_resumeSid, m_resumeUrl, m_resumeSeq);
+}
+
+void ServiceController::onSessionInvalid()
+{
+    // Seen once: a RESUME sent while Discord still counts the UI's dropped connection as
+    // alive was refused, and the same one a few seconds later was accepted. Retry once
+    // with the same state before giving up.
+    if (!m_resumeRetried && m_resumeSeq >= 0 && m_gateway) {
+        m_resumeRetried = true;
+        qWarning() << "[Service] RESUME refused - retrying once in 8 s";
+        QTimer::singleShot(8000, this, SLOT(retryResume()));
+        return;
+    }
+    ServiceSession::clearGateway();
+    // Discord no longer knows the session. A new IDENTIFY would bring a ~5 MB READY that
+    // does not fit in this process, so stay idle until the app has run (it makes a new one).
+    qWarning() << "[Service] the gateway session expired - idle until the app runs again";
+    m_sessionDead = true;
+    QTimer::singleShot(0, this, SLOT(onStopRequested()));
+}
+
+void ServiceController::onGatewayDispatch(const QString &eventName, const QVariantMap &payload)
+{
+    if (eventName != QLatin1String("MESSAGE_CREATE") || !m_notifier || !m_hub) return;
+
+    const QString msgId = payload.value("id").toString();
+    if (!msgId.isEmpty()) {
+        if (m_recentMessageIds.contains(msgId)) return;
+        m_recentMessageIds.append(msgId);
+        while (m_recentMessageIds.size() > RECENT_IDS_MAX) m_recentMessageIds.removeFirst();
+    }
+
+    MentionNotification n = m_notifier->buildMentionNotification(payload);
+    if (!n.shouldNotify) return;
+    m_hub->upsertThreadItem(n.sourceId, n.title, n.preview, n.timestampMs);
+    m_hub->playPingSound();
+    qDebug() << "[Service] Hub item updated for channel" << n.sourceId;
 }
 
 void ServiceController::startClient()
@@ -151,6 +304,15 @@ void ServiceController::startClient()
 
 void ServiceController::stopClient()
 {
+    if (m_gateway) {
+        qDebug() << "[Service] dropping the gateway connection";
+        m_gateway->disconnect(this);
+        delete m_gateway; // no close frame, see ~DiscordGateway()
+        m_gateway = 0;
+        delete m_notifier; m_notifier = 0;
+        delete m_hub; m_hub = 0;
+    }
+    m_gatewayNeedsReconnect = false;
     if (!m_client && !m_store) return;
     qDebug() << "[Service] disconnecting the headless client";
     if (m_client) {
@@ -164,7 +326,7 @@ void ServiceController::stopClient()
 
 void ServiceController::onHeartbeat()
 {
-    if (!m_client) return;
+    if (!m_client && !m_gateway) return;
     ++m_heartbeatTicks;
     // Every 5 s for the first 2 minutes (the heavy READY payload arrives then), then every 5 min.
     if (m_heartbeatTicks > 24 && (m_heartbeatTicks % 60) != 0) return;
