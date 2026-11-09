@@ -43,6 +43,7 @@ private slots:
     void onGatewayClosed();
     void onSessionInvalid();
     void retryResume();
+    void startIdentifyFallback();
 
 private:
     void startClient();
@@ -80,6 +81,10 @@ private:
     QString m_resumeUrl;
     int m_resumeSeq;
     bool m_resumeRetried;
+    // Fallback when Discord refuses the RESUME for good: a fresh IDENTIFY whose READY is
+    // streamed through a scanner instead of being stored (see DiscordGateway light mode).
+    bool m_identifyTried;
+    QStringList m_resumeSubs;
     QStringList m_recentMessageIds; // replayed events after a RESUME must not ping twice
 };
 

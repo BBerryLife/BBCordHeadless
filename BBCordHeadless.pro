@@ -64,6 +64,7 @@ HEADERS += \
     $$UI_ROOT/src/core/HubShared.hpp \
     $$UI_ROOT/src/core/ServiceHandoff.hpp \
     $$UI_ROOT/src/core/ServiceSession.hpp \
+    $$UI_ROOT/src/core/discord/StreamScanner.hpp \
     $$UI_ROOT/src/core/client/AvatarManager.hpp \
     $$UI_ROOT/src/core/client/AvatarState.hpp \
     $$UI_ROOT/src/core/client/CacheManager.hpp \

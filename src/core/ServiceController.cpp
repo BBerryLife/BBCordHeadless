@@ -15,6 +15,8 @@
 #include <malloc.h>
 
 #include <QByteArray>
+#include <QDir>
+#include <QFile>
 #include <QDateTime>
 #include <QDebug>
 #include <QSettings>
@@ -31,6 +33,14 @@ static const int RETRY_MAX_MS = 300000;
 // Notifications do not need sub-second latency.
 static const int SERVICE_POLL_MS = 250;
 static const int RECENT_IDS_MAX = 64;
+
+// Markers in the app data folder guard against an out-of-memory crash loop: the "inflight"
+// file exists while an IDENTIFY fallback is running; if the service finds it at startup the
+// previous attempt died (almost certainly the 3 MB heap limit), so the fallback is disabled
+// until the "crashed" marker is deleted (it is also deleted after any success).
+static QString identifyInflightPath() { return QDir::homePath() + "/bbcord_identify_inflight"; }
+static QString identifyCrashedPath() { return QDir::homePath() + "/bbcord_identify_crashed"; }
+
 
 // The Hub invoke data is JSON like {"attributes": {"sourceId": "<channelId>", ...}}. Only
 // that one field is needed, so it is read with a plain scan instead of a JSON library.
@@ -75,7 +85,8 @@ ServiceController::ServiceController(QObject *parent)
       m_hub(0),
       m_gatewayNeedsReconnect(false),
       m_resumeSeq(-1),
-      m_resumeRetried(false)
+      m_resumeRetried(false),
+      m_identifyTried(false)
 {
     connect(m_invoke, SIGNAL(invoked(const bb::system::InvokeRequest&)),
             this,     SLOT(onInvoked(const bb::system::InvokeRequest&)));
@@ -157,6 +168,13 @@ void ServiceController::startResumeSession()
         return;
     }
 
+    if (QFile::exists(identifyInflightPath())) {
+        QFile::remove(identifyInflightPath());
+        QFile crashed(identifyCrashedPath());
+        if (crashed.open(QIODevice::WriteOnly)) { crashed.write("1"); crashed.close(); }
+        qWarning() << "[Service] the previous IDENTIFY fallback did not finish (crash/OOM) - disabled";
+    }
+
     ServiceSession::GatewayState gs;
     if (!ServiceSession::loadGateway(&gs)) {
         qDebug() << "[Service] no gateway session left by the app yet - idle until the app has run";
@@ -199,6 +217,8 @@ void ServiceController::startResumeSession()
     m_resumeUrl = gs.resumeUrl;
     m_resumeSeq = gs.seq;
     m_resumeRetried = false;
+    m_identifyTried = false;
+    m_resumeSubs = gs.subs;
     m_gateway->resumeGateway(m_token, gs.sessionId, gs.resumeUrl, gs.seq);
 }
 
@@ -236,6 +256,28 @@ void ServiceController::onGatewayClosed()
     }
 }
 
+void ServiceController::startIdentifyFallback()
+{
+    m_identifyTried = true;
+    if (QFile::exists(identifyCrashedPath())) {
+        qWarning() << "[Service] session lost; IDENTIFY fallback disabled (it crashed the service"
+                   << "before). Open the app once to refresh the session.";
+        ServiceSession::clearGateway();
+        m_sessionDead = true;
+        QTimer::singleShot(0, this, SLOT(onStopRequested()));
+        return;
+    }
+    qWarning() << "[Service] session lost - new IDENTIFY, READY will be streamed, not stored";
+    QFile marker(identifyInflightPath());
+    if (marker.open(QIODevice::WriteOnly)) {
+        marker.write("1");
+        marker.close();
+    }
+    ServiceSession::clearGateway();
+    m_gateway->setLightStreamMode(true);
+    m_gateway->connectToGateway(m_token);
+}
+
 void ServiceController::retryResume()
 {
     if (!m_gateway || m_sessionDead) return;
@@ -245,13 +287,16 @@ void ServiceController::retryResume()
 
 void ServiceController::onSessionInvalid()
 {
-    // Seen once: a RESUME sent while Discord still counts the UI's dropped connection as
-    // alive was refused, and the same one a few seconds later was accepted. Retry once
-    // with the same state before giving up.
-    if (!m_resumeRetried && m_resumeSeq >= 0 && m_gateway) {
+    // Op 9 with d:true means "wait and try again"; d:false means the session is gone for
+    // good (a retry is pointless: Discord drops it when it refuses the first RESUME).
+    if (!m_resumeRetried && m_resumeSeq >= 0 && m_gateway && m_gateway->lastInvalidResumable()) {
         m_resumeRetried = true;
-        qWarning() << "[Service] RESUME refused - retrying once in 8 s";
-        QTimer::singleShot(8000, this, SLOT(retryResume()));
+        qWarning() << "[Service] RESUME refused but resumable - retrying once in 3 s";
+        QTimer::singleShot(3000, this, SLOT(retryResume()));
+        return;
+    }
+    if (!m_identifyTried && m_gateway) {
+        startIdentifyFallback();
         return;
     }
     ServiceSession::clearGateway();
@@ -276,7 +321,6 @@ void ServiceController::onGatewayDispatch(const QString &eventName, const QVaria
     MentionNotification n = m_notifier->buildMentionNotification(payload);
     if (!n.shouldNotify) return;
     m_hub->upsertThreadItem(n.sourceId, n.title, n.preview, n.timestampMs);
-    m_hub->playPingSound();
     qDebug() << "[Service] Hub item updated for channel" << n.sourceId;
 }
 
@@ -337,6 +381,19 @@ void ServiceController::onHeartbeat()
 
 void ServiceController::onLoginSucceeded()
 {
+    if (m_gateway && m_identifyTried) {
+        // Fresh session: Discord only sends guild-channel messages for channels subscribed
+        // on THIS session, so repeat the subscriptions the app had made.
+        QFile::remove(identifyInflightPath());
+        QFile::remove(identifyCrashedPath());
+        qDebug() << "[Service] IDENTIFY fallback succeeded; re-subscribing" << m_resumeSubs.size();
+        for (int i = 0; i < m_resumeSubs.size(); ++i) {
+            const QString key = m_resumeSubs.at(i);
+            const int sep = key.indexOf(QChar(':'));
+            if (sep > 0) m_gateway->sendLazyRequest(key.left(sep), key.mid(sep + 1));
+        }
+        m_resumeSubs.clear();
+    }
     qDebug() << "[Service] background gateway connected";
     m_retryDelayMs = RETRY_MIN_MS;
     m_oomFailures = 0;
